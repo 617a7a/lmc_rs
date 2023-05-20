@@ -1,3 +1,5 @@
+// adds two numbers and prints the result
+
 INP
 STA num1
 INP

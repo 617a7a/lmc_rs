@@ -1,10 +1,10 @@
 // LMC VM (interpreter) in Rust
 
-use tracing::{debug, info};
+use tracing::{debug, info, trace};
 
 const MEMORY_SIZE: usize = 100;
 
-#[repr(u16)]
+#[repr(usize)]
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Instruction {
     /// INPUT: Retrieve user input and stores it in the accumulator. 901
@@ -59,7 +59,7 @@ struct MemoryAddress(usize);
 
 impl MemoryAddress {
     fn new(address: usize) -> Result<Self, Error> {
-        if address > (MEMORY_SIZE-1) {
+        if address > (MEMORY_SIZE - 1) {
             Err(Error::InvalidMemoryAddress)
         } else {
             Ok(Self(address))
@@ -67,7 +67,7 @@ impl MemoryAddress {
     }
 
     fn increment(&mut self) {
-        if self.0 == (MEMORY_SIZE-1) {
+        if self.0 == (MEMORY_SIZE - 1) {
             self.0 = 0;
         } else {
             self.0 += 1;
@@ -102,6 +102,20 @@ struct VM {
     mdr: MemoryValue,
     /// The current instruction register is a register that stores the current instruction that is being executed.
     cir: Instruction,
+    cycle: usize,
+    halted: bool,
+}
+
+impl std::fmt::Debug for VM {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "")?;
+        writeln!(f, "ACC: {:02}", self.acc)?;
+        writeln!(f, "PC: {:02}", self.pc.0)?;
+        writeln!(f, "MAR: {:02}", self.mar.0)?;
+        writeln!(f, "MDR: {:?}", self.mdr)?;
+        writeln!(f, "CIR: {:?}", self.cir)?;
+        writeln!(f, "CYCLE: {:?}", self.cycle)
+    }
 }
 
 impl VM {
@@ -113,22 +127,25 @@ impl VM {
             mar: addr!(0),
             mdr: MemoryValue::Value(0),
             cir: Instruction::HLT,
+            cycle: 0,
+            halted: false,
         }
     }
 
     fn load_memory(&mut self, ram: Memory) {
         self.ram = ram;
-        debug!("Loaded memory {:?} into VM", ram);
     }
 
     /// Executes a single cycle of the VM using the FDE cycle
     fn execute_cycle(&mut self) {
         self.fetch();
         self.decode_execute();
+        trace!("Registers: \n{:?}", self);
     }
 
     fn fetch(&mut self) {
-        let span = tracing::span!(tracing::Level::DEBUG, "fetch");
+        self.cycle += 1;
+        let span = tracing::span!(tracing::Level::DEBUG, "fetch", cycle = self.cycle);
         let _guard = span.enter();
 
         debug!("Fetching instruction at address {:?}", self.pc);
@@ -137,7 +154,6 @@ impl VM {
         self.pc.increment();
         // fetch from memory
         self.mdr = self.ram[self.mar.0 as usize];
-        debug!("Fetched MemoryValue {:?}", self.mdr);
         self.cir = match self.mdr {
             MemoryValue::Value(_) => unreachable!(),
             MemoryValue::Instruction(instruction) => instruction,
@@ -145,7 +161,7 @@ impl VM {
     }
 
     fn decode_execute(&mut self) {
-        let span = tracing::span!(tracing::Level::DEBUG, "decode_execute");
+        let span = tracing::span!(tracing::Level::DEBUG, "decode_execute", cycle = self.cycle);
         let _guard = span.enter();
         debug!("Executing instruction {:?}", self.cir);
         // decode instruction
@@ -212,7 +228,7 @@ impl VM {
             }
             Instruction::HLT => {
                 // stop the program
-                std::process::exit(0);
+                self.halted = true;
             }
         }
     }
@@ -226,107 +242,207 @@ fn main() {
 
     let mut vm = VM::new();
 
-    // read the file
+    debug!("Reading file {}", filename);
     let contents =
         std::fs::read_to_string(filename).expect("Something went wrong reading the file");
-
+    debug!("Read file contents: \n{}", contents);
+    debug!("Parsing program into memory");
     vm.load_memory(parse_program(contents).unwrap());
+    debug!("Loaded program into memory");
 
-    loop {
+    debug!("Executing program");
+    while !vm.halted {
         vm.execute_cycle();
     }
+    debug!("Program execution complete");
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 enum Error {
     InvalidInstruction(usize),
     InvalidMemoryAddress,
     InvalidValue,
 }
 
-fn parse_program(code: String) -> Result<Memory, Error> {
-    let mut ram: Memory = [MemoryValue::Value(0); MEMORY_SIZE];
+#[derive(Clone)]
+struct Line {
+    /// An optional text symbol that can be used to reference this line/memory address
+    symbol: Option<String>,
+    /// The instruction to be executed as a string
+    instruction_string: String,
+}
 
-    debug!("Parsing program: {:?}", code.replace("\n", ", "));
+impl std::fmt::Debug for Line {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        if let Some(symbol) = &self.symbol {
+            write!(f, "{} {}", symbol, self.instruction_string)
+        } else {
+            write!(f, "{}", self.instruction_string)
+        }
+    }
+}
+
+fn parse_program(code: String) -> Result<Memory, Error> {
+    let span = tracing::span!(tracing::Level::DEBUG, "parse_program");
+    let _guard = span.enter();
+
+    let mut ram: Memory = [MemoryValue::Value(0); MEMORY_SIZE];
 
     // split the file into lines
     let lines = code
         .split("\n")
-        .map(|line| line.trim())
-        .filter(|line| !line.is_empty());
+        // .filter(|line| !line.starts_with("//"))
+        .map(|line| clean_line(line.trim()))
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            // map into Line structs
+            let mut split_line = line.split_whitespace();
+            let first = split_line.next().unwrap();
 
-    debug!("Read {:?} lines", lines.clone().count());
+            let has_symbol = !matches!(
+                first,
+                "INP" | "OUT" | "LDA" | "STA" | "ADD" | "SUB" | "BRP" | "BRZ" | "BRA" | "HLT"
+            );
+
+            let symbol = if has_symbol {
+                Some(first.to_string())
+            } else {
+                None
+            };
+
+            let instruction_string = if has_symbol {
+                split_line.collect::<Vec<&str>>().join(" ")
+            } else {
+                line
+            };
+
+            Line {
+                symbol,
+                instruction_string,
+            }
+        });
 
     // split lines into DAT and non-DAT lines
-    let (dat_lines, lines): (Vec<&str>, Vec<&str>) = lines.partition(|line| line.find("DAT").is_some());
+    let (dat_lines, mut lines): (Vec<Line>, Vec<Line>) =
+        lines.partition(|line| line.instruction_string.contains("DAT"));
 
-    let mut lines: Vec<String> = lines.iter().map(|line| line.to_string()).collect();
+    debug!("Recognised {} DAT lines", dat_lines.len());
+    debug!("Recognised {} instructions", lines.len());
+
+    fn replace_symbol_with_address(lines: &mut Vec<Line>, symbol: &str, address: usize) {
+        let str_address = format!("{}", address);
+        for line in lines {
+            // only replace WHOLE words, not substrings
+            let instruction_string = line.instruction_string.clone();
+            line.instruction_string = instruction_string.split_whitespace().map(|word| {
+                if word == symbol {
+                    str_address.clone()
+                } else {
+                    word.to_string()
+                }
+            }).collect::<Vec<String>>().join(" ");
+        }
+    }
 
     // allocate memory address for each DAT line and store the value if given
     // then replace the identifier in lines with the memory address
     for (i, line) in dat_lines.iter().enumerate() {
-        let line = line.trim_start_matches("DAT");
-        let split_line: Vec<&str> = line.split_whitespace().collect();
+        let split_line: Vec<&str> = line.instruction_string.split_whitespace().collect();
 
-        let value = if split_line.len() == 3 {
-            split_line[2]
-                .parse::<isize>()
-                .map_err(|_| Error::InvalidValue)?
-        } else {
-            0
+        let symbol = line
+            .symbol
+            .clone()
+            .expect(format!("Invalid DAT line: {:?}", line).as_str());
+
+        let value = match split_line.get(1) {
+            Some(value) => match value.parse::<isize>() {
+                Ok(value) => value,
+                Err(_) => return Err(Error::InvalidValue),
+            },
+            None => 0,
         };
 
         let address = i + lines.len();
+
+        // initialize memory address with given value
         ram[address] = MemoryValue::Value(value);
-        lines = lines
-            .iter()
-            .map(|line| line.replace(split_line[0], &address.to_string()))
-            .collect();
+
+        replace_symbol_with_address(&mut lines, &symbol, address);
     }
 
-    // read each line and parse it into an instruction using its index as the memory address
+    let marked_lines: Vec<(usize, Line)> = lines
+        .clone()
+        .iter()
+        .enumerate()
+        .filter(|(_, line)| line.symbol.is_some())
+        .map(|(i, line)| (i, line.clone()))
+        .collect();
+
+    // check for duplicate symbols
+    for (i, line) in marked_lines.iter() {
+        for (j, other_line) in marked_lines.iter() {
+            if i != j && line.symbol == other_line.symbol {
+                return Err(Error::InvalidInstruction(*i));
+            }
+        }
+    }
+
+    // replace any uses of symbols with the memory address
+    debug!(
+        "Adding {:?} marker(s) into instructions",
+        marked_lines.len()
+    );
+    for (address, line) in marked_lines.iter() {
+        // if the line has a symbol, replace any uses of the symbol in lines with the memory address
+        let symbol = line.symbol.as_ref().unwrap();
+        replace_symbol_with_address(&mut lines, symbol, *address);
+    }
+
     for (i, line) in lines.iter().enumerate() {
-        let line = line.trim();
-        let mut parts = line.split_whitespace();
+        let mut instruction = line.instruction_string.split_whitespace();
 
-        let instruction_str = match parts.next() {
-            Some(instruction) => instruction,
-            None => return Err(Error::InvalidInstruction(i)),
+        let opcode = instruction.next().unwrap();
+        let argument = instruction.next();
+
+        let get_arg = || {
+            argument
+                .expect(format!("Invalid instruction: {:?}", line).as_str())
+                .parse::<usize>()
+                .expect(format!("Invalid instruction: {:?}", line).as_str())
         };
 
-        let mut next_part = || {
-            Ok(match parts.next() {
-                Some(part) => match part.parse::<usize>() {
-                    Ok(part) => addr!(part),
-                    Err(_) => return Err(Error::InvalidValue),
-                },
-                None => return Err(Error::InvalidInstruction(i)),
-            })
-        };
-
-        let instruction = match instruction_str {
+        let instruction = match opcode {
             "INP" => Instruction::INP,
             "OUT" => Instruction::OUT,
-            "LDA" => Instruction::LDA(next_part()?),
-            "STA" => Instruction::STA(next_part()?),
-            "ADD" => Instruction::ADD(next_part()?),
-            "SUB" => Instruction::SUB(next_part()?),
-            "BRP" => Instruction::BRP(next_part()?),
-            "BRZ" => Instruction::BRZ(next_part()?),
-            "BRA" => Instruction::BRA(next_part()?),
+            "LDA" => Instruction::LDA(addr!(get_arg())),
+            "STA" => Instruction::STA(addr!(get_arg())),
+            "ADD" => Instruction::ADD(addr!(get_arg())),
+            "SUB" => Instruction::SUB(addr!(get_arg())),
+            "BRP" => Instruction::BRP(addr!(get_arg())),
+            "BRZ" => Instruction::BRZ(addr!(get_arg())),
+            "BRA" => Instruction::BRA(addr!(get_arg())),
             "HLT" => Instruction::HLT,
             _ => return Err(Error::InvalidInstruction(i)),
         };
+
         ram[i] = MemoryValue::Instruction(instruction);
     }
 
     Ok(ram)
 }
 
+fn clean_line(line: &str) -> String {
+    line
+        .split("//").next().unwrap()
+        .chars()
+        .filter(|c| c.is_alphanumeric() || c.is_whitespace())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     fn test_parse_program(program: &str, wanted: &[MemoryValue]) {
         let ram = parse_program(program.to_string()).unwrap();
 
@@ -356,5 +472,20 @@ mod tests {
                 MemoryValue::Value(0),
             ],
         );
+    }
+
+    #[test]
+    fn test_run_factorial() {
+        let program = include_str!("../lmc/factorial.lmc");
+        let ram = parse_program(program.to_string()).unwrap();
+
+        let mut vm = VM::new();
+        vm.load_memory(ram);
+
+        while !vm.halted {
+            vm.execute_cycle();
+        }
+
+        assert_eq!(vm.acc, 2_432_902_008_176_640_000);
     }
 }

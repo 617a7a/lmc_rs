@@ -8,3 +8,7 @@ edition = "2021"
 [dependencies]
 tracing = "0.1.37"
 tracing-subscriber = "0.3.17"
+
+[[bin]]
+name = "lmc"
+path = "src/main.rs"

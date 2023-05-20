@@ -1,3 +1,4 @@
+// a simple countdown program
         INP
 loop    OUT
         STA count
