@@ -77,7 +77,7 @@ impl VirtualMachine for VM {
         // fetch from memory
         self.mdr = self.ram[self.mar.0 as usize];
         self.cir = match self.mdr {
-            MemoryValue::Value(_) => unreachable!(),
+            MemoryValue::Value(_) => panic!("Fetched value from memory instead of instruction"),
             MemoryValue::Instruction(instruction) => instruction,
         };
     }
