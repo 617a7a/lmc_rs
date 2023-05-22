@@ -2,6 +2,7 @@
 name = "lmc-rs"
 version = "0.1.0"
 edition = "2021"
+type = "lib"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -11,4 +12,4 @@ tracing-subscriber = "0.3.17"
 
 [[bin]]
 name = "lmc"
-path = "src/main.rs"
+path = "src/bin.rs"
